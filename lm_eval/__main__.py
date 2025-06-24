@@ -295,6 +295,17 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Confirm that you understand the risks of running unsafe code for tasks that require it",
     )
     parser.add_argument(
+        "--save_logits",
+        action="store_true",
+        help="Save model logits at each generation step to disk for analysis",
+    )
+    parser.add_argument(
+        "--logits_save_dir",
+        type=str,
+        default="./logits_output",
+        help="Directory to save logits files (default: ./logits_output)",
+    )
+    parser.add_argument(
         "--metadata",
         type=json.loads,
         default=None,
@@ -345,6 +356,20 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
 
     if args.include_path is not None:
         eval_logger.info(f"Including path: {args.include_path}")
+    
+    # Add logits saving arguments to model_args
+    if args.save_logits:
+        logits_args = f",save_logits={args.save_logits},logits_save_dir={args.logits_save_dir}"
+        if isinstance(args.model_args, str):
+            args.model_args = args.model_args + logits_args
+        elif isinstance(args.model_args, dict):
+            args.model_args.update({
+                "save_logits": args.save_logits,
+                "logits_save_dir": args.logits_save_dir
+            })
+        else:
+            args.model_args = logits_args.lstrip(",")
+    
     metadata = (
         simple_parse_args_string(args.model_args)
         if isinstance(args.model_args, str)

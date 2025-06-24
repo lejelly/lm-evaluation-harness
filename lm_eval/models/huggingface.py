@@ -4,6 +4,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+import json
+import numpy as np
 
 import jinja2
 import torch
@@ -93,6 +95,9 @@ class HFLM(TemplateLM):
         autogptq: Optional[Union[bool, str]] = False,
         gptqmodel: Optional[bool] = False,
         gguf_file: Optional[str] = None,
+        # logits saving options
+        save_logits: Optional[bool] = False,
+        logits_save_dir: Optional[str] = "./logits_output",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -238,6 +243,13 @@ class HFLM(TemplateLM):
         self.softmax_dtype = (
             get_dtype(softmax_dtype) if softmax_dtype is not None else None
         )
+        
+        # logits saving configuration
+        self.save_logits = save_logits
+        self.logits_save_dir = Path(logits_save_dir)
+        if self.save_logits:
+            self.logits_save_dir.mkdir(parents=True, exist_ok=True)
+            eval_logger.info(f"Logits will be saved to: {self.logits_save_dir}")
 
         if str(batch_size).startswith("auto"):
             batch_size = batch_size.split(":")
@@ -914,14 +926,114 @@ class HFLM(TemplateLM):
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
         )
-        return self.model.generate(
-            input_ids=context,
-            max_length=max_length,
-            stopping_criteria=stopping_criteria,
-            pad_token_id=self.tokenizer.pad_token_id,
-            use_cache=True,
-            **generation_kwargs,
+        if self.save_logits:
+            return self._model_generate_with_logits(
+                context=context,
+                max_length=max_length,
+                stop=stop,
+                stopping_criteria=stopping_criteria,
+                **generation_kwargs,
+            )
+        else:
+            return self.model.generate(
+                input_ids=context,
+                max_length=max_length,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=self.tokenizer.pad_token_id,
+                use_cache=True,
+                **generation_kwargs,
+            )
+
+    def _model_generate_with_logits(
+        self, context, max_length, stop, stopping_criteria, **generation_kwargs
+    ):
+        """
+        Custom generation function that captures logits at each step
+        """
+        batch_size = context.shape[0]
+        device = context.device
+        
+        # Initialize generation tracking
+        generated_tokens = context.clone()
+        logits_sequence = []
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # Generation loop
+        for step in range(max_length - context.shape[1]):
+            if finished.all():
+                break
+                
+            # Forward pass to get logits
+            with torch.no_grad():
+                outputs = self.model(generated_tokens)
+                logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+                
+                # Save logits for this step
+                logits_sequence.append(logits.cpu().numpy())
+                
+                # Apply temperature if specified
+                temp = generation_kwargs.get("temperature", 1.0)
+                if temp != 1.0:
+                    logits = logits / temp
+                
+                # Sample or select next token
+                if generation_kwargs.get("do_sample", False):
+                    probs = F.softmax(logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+                
+                # Update generated tokens
+                generated_tokens = torch.cat([generated_tokens, next_tokens], dim=-1)
+                
+                # Check stopping criteria
+                if stopping_criteria:
+                    should_stop = stopping_criteria(generated_tokens, None)
+                    if should_stop:
+                        break
+                
+                # Check for EOS token
+                eos_token_id = self.tokenizer.eos_token_id
+                if eos_token_id is not None:
+                    finished = finished | (next_tokens.squeeze(-1) == eos_token_id)
+        
+        # Save logits to file
+        if logits_sequence:
+            self._save_generation_logits(logits_sequence, context, generated_tokens)
+        
+        return generated_tokens
+
+    def _save_generation_logits(self, logits_sequence, context, generated_tokens):
+        """
+        Save logits sequence to file with metadata
+        """
+        import hashlib
+        import time
+        
+        # Create unique filename based on context hash and timestamp
+        context_str = self.tokenizer.decode(context[0], skip_special_tokens=True)
+        context_hash = hashlib.md5(context_str.encode()).hexdigest()[:8]
+        timestamp = int(time.time())
+        filename = f"logits_{context_hash}_{timestamp}.npz"
+        
+        # Prepare data for saving
+        logits_array = np.array(logits_sequence)  # [steps, batch_size, vocab_size]
+        context_tokens = context.cpu().numpy()
+        generated_tokens_array = generated_tokens.cpu().numpy()
+        
+        # Save with metadata
+        save_path = self.logits_save_dir / filename
+        np.savez_compressed(
+            save_path,
+            logits=logits_array,
+            context_tokens=context_tokens,
+            generated_tokens=generated_tokens_array,
+            context_text=context_str,
+            vocab_size=len(self.tokenizer),
+            model_name=self.pretrained,
         )
+        
+        eval_logger.debug(f"Saved logits for generation to: {save_path}")
 
     def _select_cont_toks(
         self, logits: torch.Tensor, contlen: int = None, inplen: int = None
