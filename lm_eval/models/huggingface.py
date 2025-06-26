@@ -908,7 +908,7 @@ class HFLM(TemplateLM):
                 )
                 return self.model(inps).logits
 
-    def _model_generate(self, context, max_length, stop, instance_metadata=None, **generation_kwargs):
+    def _model_generate(self, context, max_length, stop, attention_mask=None, instance_metadata=None, **generation_kwargs):
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
         # remove temperature, as do_sample=False takes care of this
@@ -932,6 +932,7 @@ class HFLM(TemplateLM):
         # This path should not be reached when save_metrics is True
         return self.model.generate(
             input_ids=context,
+            attention_mask=attention_mask,
             max_length=max_length,
             stopping_criteria=stopping_criteria,
             pad_token_id=self.tokenizer.pad_token_id,
@@ -1004,51 +1005,61 @@ class HFLM(TemplateLM):
         """
         batch_size = context.shape[0]
         
-        # Use custom generation loop to capture logits
+        # Use model.generate() with output_scores=True for efficient generation
         with torch.no_grad():
-            input_ids = context
-            attention_mask = attention_mask
-            max_length = generation_kwargs.get("max_length", self.max_length)
+            # Set up generation parameters
+            generation_kwargs = generation_kwargs.copy()
+            generation_kwargs["output_scores"] = True
+            generation_kwargs["return_dict_in_generate"] = True
             
-            # Store logits for each sample separately
-            batch_logits_sequences = [[] for _ in range(batch_size)]
+            # Apply same temperature/do_sample logic as in _model_generate
+            generation_kwargs["temperature"] = generation_kwargs.get("temperature", 0.0)
+            do_sample = generation_kwargs.get("do_sample", None)
             
-            # Generate token by token
-            for _ in range(max_length - input_ids.shape[1]):
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = outputs.logits
-                
-                # Save logits for each sample
-                for i in range(batch_size):
-                    batch_logits_sequences[i].append(logits[i, -1, :].cpu().numpy())
-                
-                # Get next tokens
-                next_tokens = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                
-                # Update input_ids and attention_mask
-                input_ids = torch.cat([input_ids, next_tokens], dim=-1)
-                attention_mask = torch.cat([attention_mask, torch.ones_like(next_tokens)], dim=-1)
-                
-                # Check for stop sequences
-                should_stop = torch.zeros(batch_size, dtype=torch.bool)
-                for i, next_token in enumerate(next_tokens):
-                    if self.tok_decode([next_token.item()]) in stop:
-                        should_stop[i] = True
-                
-                if should_stop.all():
-                    break
+            # The temperature has to be a strictly positive float -- if it is 0.0, use greedy decoding strategies
+            if generation_kwargs.get("temperature") == 0.0 and do_sample is None:
+                generation_kwargs["do_sample"] = do_sample = False
             
-            # Save metrics for each sample
+            if do_sample is False and generation_kwargs.get("temperature") == 0.0:
+                generation_kwargs.pop("temperature")
+            
+            # Build stopping criteria - same as in _model_generate
+            stopping_criteria = stop_sequences_criteria(
+                self.tokenizer, stop, context.shape[1], context.shape[0]
+            )
+            generation_kwargs["stopping_criteria"] = stopping_criteria
+            generation_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+            generation_kwargs["use_cache"] = True
+            
+            # Generate with native method
+            outputs = self.model.generate(
+                input_ids=context,
+                attention_mask=attention_mask,
+                **generation_kwargs
+            )
+            
+            # Extract generated sequences and scores
+            generated_sequences = outputs.sequences
+            scores = outputs.scores if hasattr(outputs, 'scores') else None
+            
+            # Process each sample in the batch
             for i in range(batch_size):
-                if batch_metadata and i < len(batch_metadata) and batch_metadata[i]:
+                if batch_metadata and i < len(batch_metadata) and batch_metadata[i] and scores:
+                    # Extract logits for this sample
+                    sample_logits = []
+                    for step_scores in scores:
+                        # scores is a tuple of tensors, each of shape [batch_size, vocab_size]
+                        sample_logits.append(step_scores[i].cpu().numpy())
+                    
+                    # Save metrics for this sample
                     self._save_generation_metrics(
-                        batch_logits_sequences[i], 
-                        context[i:i+1], 
-                        input_ids[i:i+1], 
+                        sample_logits,
+                        context[i:i+1],
+                        generated_sequences[i:i+1],
                         batch_metadata[i]
                     )
             
-            return input_ids
+            return generated_sequences
 
     def _save_generation_metrics(self, logits_sequence, context, generated_tokens, instance_metadata=None):
         """
@@ -1165,17 +1176,36 @@ class HFLM(TemplateLM):
             )
             
             # Process results
-            for i, (cont_toks, context) in enumerate(zip(cont, contexts)):
-                cont_toks = cont_toks.tolist()
+            for i, (cont_seq, context) in enumerate(zip(cont, contexts)):
+                # cont_seq is the full sequence from model.generate()
+                # We need to extract only the generated portion
                 if self.backend == "causal":
-                    cont_toks = cont_toks[context_enc[i].shape[0]:]
+                    # Get the length of the input context for this sample
+                    input_length = context_enc[i].shape[0]
+                    # Extract only the generated tokens
+                    cont_toks = cont_seq[input_length:].tolist()
+                else:
+                    # For seq2seq models, the entire output is the generation
+                    cont_toks = cont_seq.tolist()
                 
                 s = self.tok_decode(cont_toks)
+                
+                # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+                for term in until:
+                    if len(term) > 0:
+                        # ignore '' separator,
+                        # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
+                        s = s.split(term)[0]
+                
                 res.append(s)
             
             pbar.update(len(chunk))
         
         pbar.close()
+        
+        # reorder results back to original unsorted form
+        res = re_ords.get_original(res)
+        
         return res
 
     def _generate_until_with_metrics_tracking(self, requests: List[Instance], disable_tqdm: bool = False):
@@ -1327,12 +1357,40 @@ class HFLM(TemplateLM):
         except Exception as e:
             eval_logger.warning(f"Failed to save evaluation results to JSON: {e}")
     
-    def _update_csv_with_correctness(self, task_results):
+    def update_all_correctness_from_results(self, task_name, samples):
         """
-        Legacy batch update method - kept for compatibility but no longer used
-        since we now update correctness per sample
+        Update correctness for all samples in a task after evaluation completes
+        
+        Args:
+            task_name: Name of the task
+            samples: List of sample results from evaluation
         """
-        eval_logger.debug("Batch correctness update called but skipped - using per-sample updates instead")
+        if not self.save_metrics or not hasattr(self, '_metrics_calculator'):
+            return
+            
+        eval_logger.info(f"Updating correctness for {len(samples)} samples in task {task_name}")
+        
+        for sample in samples:
+            try:
+                doc_id = sample.get('doc_id', -1)
+                idx = sample.get('idx', 0)
+                
+                # Determine correctness based on task metrics
+                is_correct = False
+                if 'exact_match' in sample:
+                    is_correct = bool(sample['exact_match'])
+                elif 'acc' in sample:
+                    is_correct = bool(sample['acc'])
+                elif 'pass' in sample:
+                    is_correct = bool(sample['pass'])
+                elif 'correct' in sample:
+                    is_correct = bool(sample['correct'])
+                
+                # Update in CSV
+                self._metrics_calculator.update_correctness(task_name, doc_id, idx, is_correct)
+                
+            except Exception as e:
+                eval_logger.warning(f"Failed to update correctness for sample {doc_id}: {e}")
         pass
     
 

@@ -83,6 +83,48 @@ class MetricsCalculator:
         # 全トークンの平均を返す
         return np.mean(entropies)
     
+    @staticmethod
+    def compute_last_token_shannon_entropy(logits):
+        """
+        最後のトークンのShannon Entropyのみを計算
+        
+        Args:
+            logits: [sequence_length, vocab_size] のlogits
+            
+        Returns:
+            float: 最後のトークンのShannon Entropy
+        """
+        # 最後のトークンのlogitsを取得
+        last_token_logits = logits[-1]  # [vocab_size]
+        
+        # float32に変換して数値精度を向上
+        last_token_logits = last_token_logits.astype(np.float32)
+        
+        # softmaxで確率分布に変換（数値安定版）
+        logits_max = np.max(last_token_logits)
+        exp_logits = np.exp(last_token_logits - logits_max)
+        probs = exp_logits / np.sum(exp_logits)
+        
+        # Shannon Entropy計算: -sum(p * log(p))
+        # 注: 自然対数を使用（情報理論の標準）
+        # p=0の場合、0*log(0)=0として扱う
+        mask = probs > 0
+        if np.any(mask):
+            entropy = -np.sum(probs[mask] * np.log(probs[mask]))
+        else:
+            entropy = 0.0
+        
+        # NaNチェック
+        if np.isnan(entropy) or np.isinf(entropy):
+            print(f"ERROR: Last token Shannon Entropy calculation resulted in NaN/Inf!")
+            print(f"  logits shape: {last_token_logits.shape}")
+            print(f"  logits min/max: {np.min(last_token_logits)}/{np.max(last_token_logits)}")
+            print(f"  probs sum: {np.sum(probs)}")
+            print(f"  non-zero probs: {np.sum(mask)}")
+            entropy = -1.0
+        
+        return entropy
+    
     
     def calculate_and_save_metrics(self, logits_sequence, context_tokens, generated_tokens, 
                                    tokenizer, model_name, instance_metadata=None):
@@ -118,6 +160,7 @@ class MetricsCalculator:
             # Shannon Entropyを計算
             vocab_size = len(tokenizer)
             shannon_entropy = self.compute_shannon_entropy(logits)
+            #shannon_entropy = self.compute_last_token_shannon_entropy(logits)
             
             # Instance IDを作成
             import hashlib
