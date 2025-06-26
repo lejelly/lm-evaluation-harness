@@ -96,8 +96,8 @@ class HFLM(TemplateLM):
         gptqmodel: Optional[bool] = False,
         gguf_file: Optional[str] = None,
         # logits saving options
-        save_logits: Optional[bool] = False,
-        logits_save_dir: Optional[str] = "./logits_output",
+        save_metrics: Optional[bool] = False,
+        metrics_save_dir: Optional[str] = "./metrics_output",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -244,12 +244,12 @@ class HFLM(TemplateLM):
             get_dtype(softmax_dtype) if softmax_dtype is not None else None
         )
         
-        # logits saving configuration
-        self.save_logits = save_logits
-        self.logits_save_dir = Path(logits_save_dir)
-        if self.save_logits:
-            self.logits_save_dir.mkdir(parents=True, exist_ok=True)
-            eval_logger.info(f"Logits will be saved to: {self.logits_save_dir}")
+        # metrics saving configuration
+        self.save_metrics = save_metrics
+        self.metrics_save_dir = Path(metrics_save_dir)
+        if self.save_metrics:
+            self.metrics_save_dir.mkdir(parents=True, exist_ok=True)
+            eval_logger.info(f"Metrics will be saved to: {self.metrics_save_dir}")
 
         if str(batch_size).startswith("auto"):
             batch_size = batch_size.split(":")
@@ -908,7 +908,7 @@ class HFLM(TemplateLM):
                 )
                 return self.model(inps).logits
 
-    def _model_generate(self, context, max_length, stop, **generation_kwargs):
+    def _model_generate(self, context, max_length, stop, instance_metadata=None, **generation_kwargs):
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
         # remove temperature, as do_sample=False takes care of this
@@ -926,26 +926,21 @@ class HFLM(TemplateLM):
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
         )
-        if self.save_logits:
-            return self._model_generate_with_logits(
-                context=context,
-                max_length=max_length,
-                stop=stop,
-                stopping_criteria=stopping_criteria,
-                **generation_kwargs,
-            )
-        else:
-            return self.model.generate(
-                input_ids=context,
-                max_length=max_length,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=self.tokenizer.pad_token_id,
-                use_cache=True,
-                **generation_kwargs,
-            )
+        # Note: When save_metrics is True, generation should be handled by
+        # _generate_until_with_metrics_tracking_batch which calls
+        # _model_generate_batch_with_metrics instead
+        # This path should not be reached when save_metrics is True
+        return self.model.generate(
+            input_ids=context,
+            max_length=max_length,
+            stopping_criteria=stopping_criteria,
+            pad_token_id=self.tokenizer.pad_token_id,
+            use_cache=True,
+            **generation_kwargs,
+        )
 
     def _model_generate_with_logits(
-        self, context, max_length, stop, stopping_criteria, **generation_kwargs
+        self, context, max_length, stop, stopping_criteria, instance_metadata=None, **generation_kwargs
     ):
         """
         Custom generation function that captures logits at each step
@@ -999,41 +994,347 @@ class HFLM(TemplateLM):
         
         # Save logits to file
         if logits_sequence:
-            self._save_generation_logits(logits_sequence, context, generated_tokens)
+            self._save_generation_metrics(logits_sequence, context, generated_tokens, instance_metadata)
         
         return generated_tokens
 
-    def _save_generation_logits(self, logits_sequence, context, generated_tokens):
+    def _model_generate_batch_with_metrics(self, context, attention_mask, stop, batch_metadata=None, **generation_kwargs):
         """
-        Save logits sequence to file with metadata
+        Generate text for a batch while capturing logits and saving metrics for each sample
         """
-        import hashlib
-        import time
+        batch_size = context.shape[0]
         
-        # Create unique filename based on context hash and timestamp
-        context_str = self.tokenizer.decode(context[0], skip_special_tokens=True)
-        context_hash = hashlib.md5(context_str.encode()).hexdigest()[:8]
-        timestamp = int(time.time())
-        filename = f"logits_{context_hash}_{timestamp}.npz"
+        # Use custom generation loop to capture logits
+        with torch.no_grad():
+            input_ids = context
+            attention_mask = attention_mask
+            max_length = generation_kwargs.get("max_length", self.max_length)
+            
+            # Store logits for each sample separately
+            batch_logits_sequences = [[] for _ in range(batch_size)]
+            
+            # Generate token by token
+            for _ in range(max_length - input_ids.shape[1]):
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                
+                # Save logits for each sample
+                for i in range(batch_size):
+                    batch_logits_sequences[i].append(logits[i, -1, :].cpu().numpy())
+                
+                # Get next tokens
+                next_tokens = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                
+                # Update input_ids and attention_mask
+                input_ids = torch.cat([input_ids, next_tokens], dim=-1)
+                attention_mask = torch.cat([attention_mask, torch.ones_like(next_tokens)], dim=-1)
+                
+                # Check for stop sequences
+                should_stop = torch.zeros(batch_size, dtype=torch.bool)
+                for i, next_token in enumerate(next_tokens):
+                    if self.tok_decode([next_token.item()]) in stop:
+                        should_stop[i] = True
+                
+                if should_stop.all():
+                    break
+            
+            # Save metrics for each sample
+            for i in range(batch_size):
+                if batch_metadata and i < len(batch_metadata) and batch_metadata[i]:
+                    self._save_generation_metrics(
+                        batch_logits_sequences[i], 
+                        context[i:i+1], 
+                        input_ids[i:i+1], 
+                        batch_metadata[i]
+                    )
+            
+            return input_ids
+
+    def _save_generation_metrics(self, logits_sequence, context, generated_tokens, instance_metadata=None):
+        """
+        Calculate metrics and save to CSV instead of saving logits as npz files
+        """
+        # Import metrics calculator
+        from .metrics_calculator import MetricsCalculator
         
-        # Prepare data for saving
-        logits_array = np.array(logits_sequence)  # [steps, batch_size, vocab_size]
-        context_tokens = context.cpu().numpy()
-        generated_tokens_array = generated_tokens.cpu().numpy()
+        # Initialize metrics calculator if not exists
+        if not hasattr(self, '_metrics_calculator'):
+            csv_path = self.metrics_save_dir / "generation_metrics.csv"
+            self._metrics_calculator = MetricsCalculator(csv_path)
         
-        # Save with metadata
-        save_path = self.logits_save_dir / filename
-        np.savez_compressed(
-            save_path,
-            logits=logits_array,
-            context_tokens=context_tokens,
-            generated_tokens=generated_tokens_array,
-            context_text=context_str,
-            vocab_size=len(self.tokenizer),
+        # Calculate and save metrics directly
+        self._metrics_calculator.calculate_and_save_metrics(
+            logits_sequence=logits_sequence,
+            context_tokens=context.cpu().numpy(),
+            generated_tokens=generated_tokens.cpu().numpy(),
+            tokenizer=self.tokenizer,
             model_name=self.pretrained,
+            instance_metadata=instance_metadata
         )
         
-        eval_logger.debug(f"Saved logits for generation to: {save_path}")
+        eval_logger.debug(f"Calculated and saved metrics for generation")
+            
+
+    def _generate_until_with_metrics_tracking_batch(self, requests: List[Instance], disable_tqdm: bool, batch_size: int, batch_fn):
+        """
+        Batch version of generate_until with metrics tracking
+        """
+        res = []
+        
+        def _collate(req: Tuple[str, dict]):
+            """Defines the key for the sorted method"""
+            toks = self.tok_encode(req[0])
+            return -len(toks), req[0]
+        
+        # Create mapping from context to request for metadata tracking
+        context_to_request = {}
+        for req in requests:
+            context = req.args[0]
+            context_to_request[context] = req
+        
+        re_ords = Collator(
+            [reg.args for reg in requests],
+            sort_fn=_collate,
+            group_by="gen_kwargs",
+            group_fn=lambda x: x[1],
+        )
+        chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
+        
+        pbar = tqdm(
+            total=len(requests),
+            disable=(disable_tqdm or (self.rank != 0)),
+            desc="Running generate_until requests with metrics tracking",
+        )
+        
+        eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
+        
+        for chunk in chunks:
+            contexts, all_gen_kwargs = zip(*chunk)
+            gen_kwargs = all_gen_kwargs[0]
+            
+            # Prepare batch metadata
+            batch_metadata = []
+            for context in contexts:
+                req = context_to_request.get(context)
+                if req:
+                    metadata = {
+                        'task_name': req.task_name,
+                        'doc_id': req.doc_id,
+                        'doc': req.doc,
+                        'idx': req.idx,
+                        'request_type': req.request_type,
+                    }
+                else:
+                    metadata = None
+                batch_metadata.append(metadata)
+            
+            # Process generation kwargs
+            if isinstance(gen_kwargs, dict):
+                kwargs = copy.deepcopy(gen_kwargs)
+                until = handle_stop_sequences(kwargs.pop("until", None), eos=eos)
+            else:
+                raise ValueError(f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}")
+            
+            max_gen_toks = kwargs.pop("max_gen_toks", self.max_gen_toks)
+            
+            # Set max context length
+            if self.backend == "causal":
+                max_ctx_len = self.max_length - max_gen_toks
+            elif self.backend == "seq2seq":
+                max_ctx_len = self.max_length
+            
+            # Encode contexts as batch
+            context_enc, attn_masks = self.tok_batch_encode(
+                contexts,
+                left_truncate_len=max_ctx_len,
+                truncation=self.truncation,
+            )
+            context_enc = context_enc.to(self.device)
+            attn_masks = attn_masks.to(self.device)
+            
+            if "max_length" not in kwargs:
+                kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
+            
+            # Generate with batch metadata
+            cont = self._model_generate_batch_with_metrics(
+                context=context_enc,
+                attention_mask=attn_masks,
+                stop=until,
+                batch_metadata=batch_metadata,
+                **kwargs,
+            )
+            
+            # Process results
+            for i, (cont_toks, context) in enumerate(zip(cont, contexts)):
+                cont_toks = cont_toks.tolist()
+                if self.backend == "causal":
+                    cont_toks = cont_toks[context_enc[i].shape[0]:]
+                
+                s = self.tok_decode(cont_toks)
+                res.append(s)
+            
+            pbar.update(len(chunk))
+        
+        pbar.close()
+        return res
+
+    def _generate_until_with_metrics_tracking(self, requests: List[Instance], disable_tqdm: bool = False):
+        """
+        Special version of generate_until that processes requests individually 
+        to enable Instance metadata tracking for metrics calculation
+        """
+        res = []
+        
+        pbar = tqdm(
+            total=len(requests),
+            disable=(disable_tqdm or (self.rank != 0)),
+            desc="Running generate_until requests with logits tracking",
+        )
+        
+        eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
+        
+        for request in requests:
+            context = request.args[0]  # Get the context string
+            gen_kwargs = request.args[1] if len(request.args) > 1 else {}
+            
+            # Prepare instance metadata
+            instance_metadata = {
+                'task_name': request.task_name,
+                'doc_id': request.doc_id,
+                'doc': request.doc,
+                'idx': request.idx,
+                'request_type': request.request_type,
+            }
+            
+            # Unpack generation kwargs
+            if isinstance(gen_kwargs, dict):
+                kwargs = copy.deepcopy(gen_kwargs)
+                until = handle_stop_sequences(kwargs.pop("until", None), eos=eos)
+            else:
+                raise ValueError(f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}")
+                
+            # Get max generation tokens
+            max_gen_toks = kwargs.pop("max_gen_toks", self.max_gen_toks)
+            
+            # Set max context length
+            if self.backend == "causal":
+                max_ctx_len = self.max_length - max_gen_toks
+                assert max_ctx_len > 0, (
+                    f"Invalid configuration: requested max tokens to generate ({max_gen_toks}) "
+                    f"must be less than model's maximum sequence length ({self.max_length})."
+                )
+            elif self.backend == "seq2seq":
+                max_ctx_len = self.max_length
+                
+            # Encode context
+            context_enc, attn_masks = self.tok_batch_encode(
+                [context],  # Single context as batch of 1
+                left_truncate_len=max_ctx_len,
+                truncation=self.truncation,
+            )
+            context_enc = context_enc.to(self.device)
+            attn_masks = attn_masks.to(self.device)
+            
+            if "max_length" not in kwargs:
+                kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
+                
+            # Perform generation with instance metadata
+            cont = self._model_generate(
+                context=context_enc,
+                attention_mask=attn_masks,
+                stop=until,
+                instance_metadata=instance_metadata,
+                **kwargs,
+            )
+            
+            # Process result
+            cont_toks = cont[0].tolist()  # Get first (and only) item from batch
+            if self.backend == "causal":
+                cont_toks = cont_toks[context_enc.shape[1]:]  # Remove context tokens
+                
+            s = self.tok_decode(cont_toks)
+            
+            # Apply stop sequences post-hoc
+            for term in until:
+                if len(term) > 0:
+                    s = s.split(term)[0]
+                    
+            res.append(s)
+            pbar.update(1)
+            
+        pbar.close()
+        return res
+    
+    def update_sample_correctness(self, task_name, doc_id, idx, correctness):
+        """
+        Update correctness for a single sample immediately after processing
+        
+        Args:
+            task_name: Task name
+            doc_id: Document ID
+            idx: Instance index
+            correctness: Boolean or float indicating correctness
+        """
+        if not self.save_metrics or not hasattr(self, '_metrics_calculator'):
+            return
+            
+        try:
+            is_correct = bool(correctness == 1.0 or correctness == True)
+            self._metrics_calculator.update_correctness(task_name, doc_id, idx, is_correct)
+            eval_logger.debug(f"Updated correctness for {task_name}_{doc_id}_{idx}: {is_correct}")
+        except Exception as e:
+            eval_logger.warning(f"Failed to update correctness for {task_name}_{doc_id}_{idx}: {e}")
+
+    def save_evaluation_results(self, results_dict):
+        """
+        Save evaluation results summary
+        
+        Args:
+            results_dict: Dictionary containing evaluation results from evaluator
+        """
+        if not self.save_metrics:
+            return
+            
+        # Create evaluation results file
+        eval_results_file = self.metrics_save_dir / "evaluation_results.json"
+        
+        # Prepare results data - filter out non-serializable objects
+        def make_serializable(obj):
+            """Recursively make object JSON serializable"""
+            if hasattr(obj, '__call__'):  # function
+                return str(obj)
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [make_serializable(item) for item in obj]
+            elif hasattr(obj, '__dict__'):  # custom object
+                return str(obj)
+            else:
+                return obj
+        
+        try:
+            results_data = {
+                'model_name': self.pretrained,
+                'results_dict': make_serializable(results_dict),
+            }
+            
+            # Save evaluation results
+            with open(eval_results_file, 'w') as f:
+                json.dump(results_data, f, indent=2)
+                
+            eval_logger.info(f"Saved evaluation results to: {eval_results_file}")
+            
+        except Exception as e:
+            eval_logger.warning(f"Failed to save evaluation results to JSON: {e}")
+    
+    def _update_csv_with_correctness(self, task_results):
+        """
+        Legacy batch update method - kept for compatibility but no longer used
+        since we now update correctness per sample
+        """
+        eval_logger.debug("Batch correctness update called but skipped - using per-sample updates instead")
+        pass
+    
 
     def _select_cont_toks(
         self, logits: torch.Tensor, contlen: int = None, inplen: int = None
@@ -1439,6 +1740,12 @@ class HFLM(TemplateLM):
         # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
         # in the same batch.
         # group_fn=lambda x: x[1] -> x=(context, gen_kwargs)
+        
+        # When saving metrics, use batch processing with metadata tracking
+        if self.save_metrics:
+            return self._generate_until_with_metrics_tracking_batch(requests, disable_tqdm, batch_size, batch_fn)
+            
+        # Normal batch processing when not saving metrics            
         re_ords = Collator(
             [reg.args for reg in requests],
             sort_fn=_collate,
@@ -1447,6 +1754,7 @@ class HFLM(TemplateLM):
         )
         chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
         eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
+        
         for chunk in chunks:
             contexts, all_gen_kwargs = zip(*chunk)
             # we assume all gen kwargs in the batch are the same

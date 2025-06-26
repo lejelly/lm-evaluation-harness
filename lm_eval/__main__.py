@@ -295,15 +295,15 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Confirm that you understand the risks of running unsafe code for tasks that require it",
     )
     parser.add_argument(
-        "--save_logits",
+        "--save_metrics",
         action="store_true",
-        help="Save model logits at each generation step to disk for analysis",
+        help="Calculate and save metrics from model outputs for analysis",
     )
     parser.add_argument(
-        "--logits_save_dir",
+        "--metrics_save_dir",
         type=str,
-        default="./logits_output",
-        help="Directory to save logits files (default: ./logits_output)",
+        default="./metrics_output",
+        help="Directory to save metrics files (default: ./metrics_output)",
     )
     parser.add_argument(
         "--metadata",
@@ -357,18 +357,18 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if args.include_path is not None:
         eval_logger.info(f"Including path: {args.include_path}")
     
-    # Add logits saving arguments to model_args
-    if args.save_logits:
-        logits_args = f",save_logits={args.save_logits},logits_save_dir={args.logits_save_dir}"
+    # Add metrics saving arguments to model_args
+    if args.save_metrics:
+        metrics_args = f",save_metrics={args.save_metrics},metrics_save_dir={args.metrics_save_dir}"
         if isinstance(args.model_args, str):
-            args.model_args = args.model_args + logits_args
+            args.model_args = args.model_args + metrics_args
         elif isinstance(args.model_args, dict):
             args.model_args.update({
-                "save_logits": args.save_logits,
-                "logits_save_dir": args.logits_save_dir
+                "save_metrics": args.save_metrics,
+                "metrics_save_dir": args.metrics_save_dir
             })
         else:
-            args.model_args = logits_args.lstrip(",")
+            args.model_args = metrics_args.lstrip(",")
     
     metadata = (
         simple_parse_args_string(args.model_args)

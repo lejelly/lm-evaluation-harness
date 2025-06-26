@@ -616,6 +616,30 @@ def evaluate(
                 metrics = task.process_results(
                     doc, [req.filtered_resps[filter_key] for req in requests]
                 )
+                
+                # Update correctness immediately for metrics tracking
+                if hasattr(lm, 'update_sample_correctness') and hasattr(lm, 'save_metrics') and lm.save_metrics:
+                    # Debug: print metrics
+                    print(f"[EVAL DEBUG] doc_id={doc_id_true}, metrics={metrics}")
+                    
+                    # Find the first correctness-related metric
+                    correctness = None
+                    for metric_name, metric_value in metrics.items():
+                        if any(indicator in metric_name.lower() for indicator in ['acc', 'exact_match', 'pass', 'correct']):
+                            correctness = metric_value
+                            print(f"[EVAL DEBUG] Found correctness metric: {metric_name}={metric_value}")
+                            break
+                    
+                    if correctness is not None:
+                        # Get task name from the first request
+                        task_name = requests[0].task_name if requests else task_output.task_name
+                        # Get idx from the first request
+                        idx = requests[0].idx if requests and hasattr(requests[0], 'idx') else 0
+                        print(f"[EVAL DEBUG] Calling update_sample_correctness({task_name}, {doc_id_true}, {idx}, {correctness})")
+                        lm.update_sample_correctness(task_name, doc_id_true, idx, correctness)
+                    else:
+                        print(f"[EVAL DEBUG] No correctness metric found in: {list(metrics.keys())}")
+                
                 if log_samples:
                     target = task.doc_to_target(doc)
                     example = {
@@ -748,6 +772,13 @@ def evaluate(
         }
         if log_samples:
             results_dict["samples"] = dict(samples)
+
+        # Save evaluation results if model supports it
+        if hasattr(lm, 'save_evaluation_results'):
+            try:
+                lm.save_evaluation_results(results_dict)
+            except Exception as e:
+                eval_logger.warning(f"Failed to save evaluation results: {e}")
 
         return results_dict
 
