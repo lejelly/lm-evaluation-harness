@@ -594,6 +594,13 @@ def evaluate(
         # Sort instances within each group
         for instances in instances_by_doc_id.values():
             instances.sort(key=lambda x: x.idx)
+        
+        # Track processed doc_ids for sample logging (to avoid duplicates)
+        logged_doc_ids = set()
+        
+        # Track correctness per doc_id (to avoid overwriting)
+        doc_correctness = {}
+        
         # iterate over different filters used
         for filter_key in task.instances[0].filtered_resps.keys():
             indices = (
@@ -617,30 +624,23 @@ def evaluate(
                     doc, [req.filtered_resps[filter_key] for req in requests]
                 )
                 
-                # Update correctness immediately for metrics tracking
-                if hasattr(lm, 'update_sample_correctness') and hasattr(lm, 'save_metrics') and lm.save_metrics:
-                    # Debug: print metrics
-                    print(f"[EVAL DEBUG] doc_id={doc_id_true}, metrics={metrics}")
-                    
-                    # Find the first correctness-related metric
-                    correctness = None
-                    for metric_name, metric_value in metrics.items():
-                        if any(indicator in metric_name.lower() for indicator in ['acc', 'exact_match', 'pass', 'correct']):
-                            correctness = metric_value
-                            print(f"[EVAL DEBUG] Found correctness metric: {metric_name}={metric_value}")
-                            break
-                    
-                    if correctness is not None:
-                        # Get task name from the first request
-                        task_name = requests[0].task_name if requests else task_output.task_name
-                        # Get idx from the first request
-                        idx = requests[0].idx if requests and hasattr(requests[0], 'idx') else 0
-                        print(f"[EVAL DEBUG] Calling update_sample_correctness({task_name}, {doc_id_true}, {idx}, {correctness})")
-                        lm.update_sample_correctness(task_name, doc_id_true, idx, correctness)
-                    else:
-                        print(f"[EVAL DEBUG] No correctness metric found in: {list(metrics.keys())}")
+                # Collect correctness (prioritize True values)
+                for metric_name, metric_value in metrics.items():
+                    if any(indicator in metric_name.lower() for indicator in ['acc', 'exact_match', 'pass', 'correct']):
+                        # If we haven't seen this doc or if this is True (1.0), update
+                        if doc_id_true not in doc_correctness or metric_value > doc_correctness[doc_id_true]['correctness']:
+                            doc_correctness[doc_id_true] = {
+                                'correctness': metric_value,
+                                'task_name': requests[0].task_name if requests else task_output.task_name,
+                                'idx': requests[0].idx if requests and hasattr(requests[0], 'idx') else 0,
+                                'filter_key': filter_key
+                            }
+                            print(f"[EVAL DEBUG] Updated correctness for doc_id={doc_id_true}: {metric_name}={metric_value} (filter={filter_key})")
                 
-                if log_samples:
+                # Log sample only once per doc_id (on first filter)
+                if log_samples and doc_id_true not in logged_doc_ids:
+                    logged_doc_ids.add(doc_id_true)
+                    
                     target = task.doc_to_target(doc)
                     example = {
                         "doc_id": doc_id_true,
@@ -666,8 +666,20 @@ def evaluate(
                     }
                     example.update(metrics)
                     task_output.logged_samples.append(example)
+                
                 for metric, value in metrics.items():
                     task_output.sample_metrics[(metric, filter_key)].append(value)
+        
+        # Update correctness for metrics tracking (once per doc, after all filters)
+        if hasattr(lm, 'update_sample_correctness') and hasattr(lm, 'save_metrics') and lm.save_metrics:
+            for doc_id_true, correctness_info in doc_correctness.items():
+                print(f"[EVAL DEBUG] Final correctness for doc_id={doc_id_true}: {correctness_info['correctness']} (from filter={correctness_info['filter_key']})")
+                lm.update_sample_correctness(
+                    correctness_info['task_name'],
+                    doc_id_true,
+                    correctness_info['idx'],
+                    correctness_info['correctness']
+                )
 
     if WORLD_SIZE > 1:
         # if multigpu, then gather data across all ranks to rank 0
