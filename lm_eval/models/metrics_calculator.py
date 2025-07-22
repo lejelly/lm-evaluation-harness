@@ -34,6 +34,7 @@ class MetricsCalculator:
                     'vocab_size',
                     'sequence_length',
                     'shannon_entropy',
+                    'self_certainty',  # Self-Certaintyを追加
                     'is_correct',  # Will be filled later
                 ])
     
@@ -52,7 +53,7 @@ class MetricsCalculator:
         
         # 各トークンのエントロピーを計算
         for step_logits in logits:  # [vocab_size]
-            # float64に変換して数値精度を向上
+            # float32に変換して数値精度を向上
             step_logits = step_logits.astype(np.float32)
             
             # softmaxで確率分布に変換（数値安定版）
@@ -83,6 +84,61 @@ class MetricsCalculator:
         # 全トークンの平均を返す
         return np.mean(entropies)
     
+    @staticmethod
+    def compute_self_certainty(logits, vocab_size):
+        """
+        Self-Certainty (KL(U||p))を計算（全トークンの平均）
+
+        Args:
+            logits: [sequence_length, vocab_size] のlogits
+            vocab_size: 語彙サイズ
+            
+        Returns:
+            float: Self-Certainty（全トークンの平均）
+        """
+        self_certainties = []
+
+        # 各トークンのself-certaintyを計算
+        for step_logits in logits:  # [vocab_size]
+            # float32に変換して数値精度を向上
+            step_logits = step_logits.astype(np.float32)
+
+            # softmaxで確率分布に変換（数値安定版）
+            logits_max = np.max(step_logits)
+            exp_logits = np.exp(step_logits - logits_max)
+            probs = exp_logits / np.sum(exp_logits)
+            
+            # Self-Certainty計算: KL(U||p) = Σ U(x) log(U(x)/p(x))
+            # = Σ (1/|V|) [log(1/|V|) - log(p(x))]
+            # = log(1/|V|) - (1/|V|)Σ log(p(x))
+            # = -log(|V|) - (1/|V|)Σ log(p(x))
+            
+            # 各トークンの-log(p)を計算
+            mask = probs > 0
+            if np.any(mask):
+                # -log(p)の平均を計算
+                neg_log_probs = -np.log(probs[mask])
+                avg_neg_log_prob = np.sum(neg_log_probs) / vocab_size
+                
+                # KL divergence
+                step_self_certainty = -np.log(vocab_size) + avg_neg_log_prob
+            else:
+                step_self_certainty = 0.0
+            
+            # NaNチェック
+            if np.isnan(step_self_certainty) or np.isinf(step_self_certainty):
+                print(f"ERROR: Self-Certainty calculation resulted in NaN/Inf!")
+                print(f"  step_logits shape: {step_logits.shape}")
+                print(f"  step_logits min/max: {np.min(step_logits)}/{np.max(step_logits)}")
+                print(f"  probs sum: {np.sum(probs)}")
+                print(f"  non-zero probs: {np.sum(mask)}")
+                step_self_certainty = -1.0
+                
+            self_certainties.append(step_self_certainty)
+
+        # 全トークンの平均を返す
+        return np.mean(self_certainties)
+
     @staticmethod
     def compute_last_token_shannon_entropy(logits):
         """
@@ -160,6 +216,8 @@ class MetricsCalculator:
             # Shannon Entropyを計算
             vocab_size = len(tokenizer)
             shannon_entropy = self.compute_shannon_entropy(logits)
+            # Self-Certaintyを計算
+            self_certainty = self.compute_self_certainty(logits, vocab_size)
             #shannon_entropy = self.compute_last_token_shannon_entropy(logits)
             
             # Instance IDを作成
@@ -188,6 +246,7 @@ class MetricsCalculator:
                 vocab_size,
                 logits.shape[0],
                 shannon_entropy,
+                self_certainty,  # Self-Certaintyを追加
                 'pending',  # is_correct - will be filled later (use 'pending' instead of empty string)
             ]
             
